@@ -1,155 +1,226 @@
-# JWT Auth API
+# 🔐 JWT Auth API
 
-A backend auth system built with **Express**, **PostgreSQL**, **Redis**, and **JWT** — following the same stateless-auth + stateful-refresh pattern used in production at companies like Razorpay and Groww.
+> **A production-grade stateless-auth + stateful-refresh system** — the same token rotation and reuse detection pattern used by companies like Razorpay and Groww.
 
-**What it does in plain English:**
-- You log in → you get two tokens: a short-lived access token (15 min) and a long-lived refresh token (7 days)
-- Every protected route is verified with pure crypto — no database hit needed
-- When your access token expires, you hit `/refresh` to get a new pair — the old one is immediately invalidated
-- If someone steals and replays an old refresh token, the system detects it and kills every active session
+![License](https://img.shields.io/badge/license-ISC-blue.svg)
+![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-green.svg)
+![Express](https://img.shields.io/badge/Express-5.x-000000.svg)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-336791.svg)
+![Redis](https://img.shields.io/badge/Redis-ioredis-DC382D.svg)
 
 ---
 
-## How it Works
+## 📋 Table of Contents
+
+- [Overview](#-overview)
+- [Architecture](#-architecture)
+- [Tech Stack](#-tech-stack)
+- [Project Structure](#-project-structure)
+- [Why Hash Refresh Tokens?](#-why-hash-refresh-tokens)
+- [Why Redis for Rate Limiting?](#-why-redis-for-rate-limiting)
+- [Getting Started](#-getting-started)
+- [API Reference](#-api-reference)
+- [Testing with Postman](#-testing-with-postman)
+
+---
+
+## 🎯 Overview
+
+JWT Auth API is a **backend authentication system** that handles:
+
+| Feature | What it does |
+|---------|-------------|
+| **Register / Login** | Creates users, verifies credentials with bcrypt |
+| **Access Tokens** | Short-lived JWTs (15 min) — verified with pure crypto, zero DB hits |
+| **Refresh Tokens** | Long-lived JWTs (7 days) stored as SHA-256 hashes in Redis |
+| **Token Rotation** | Every `/refresh` issues a new pair and invalidates the old one |
+| **Reuse Detection** | Replaying a rotated token kills all active sessions immediately |
+| **Rate Limiting** | Redis-backed login throttling — 5 attempts / 15 min, 30 min lockout |
+
+### Key Security Decisions
+
+- 🔒 **Refresh tokens are never stored raw** — only SHA-256 hashes live in Redis
+- ⏱️ **bcrypt always runs** even for non-existent users (prevents email enumeration via timing)
+- 🚨 **Token reuse = full session wipe** — a rotated token being replayed means it was stolen
+- 🌐 **Redis rate limiting** works across multiple Node processes, unlike in-memory counters
+
+---
+
+## 🏗️ Architecture
 
 ```
-  REGISTER
-  ────────
-  Client ──POST /register──► Validate → Check duplicate → bcrypt hash → Save to Postgres
-         ◄── 201 { user } ──────────────────────────────────────────────────────────────
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              CLIENT                                     │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+                   ┌────────────▼────────────┐
+                   │       Express API        │
+                   │   /api/auth/* routes     │
+                   └────────────┬────────────┘
+                                │
+         ┌──────────────────────┼──────────────────────┐
+         │                      │                      │
+┌────────▼────────┐   ┌────────▼────────┐   ┌────────▼────────┐
+│   PostgreSQL    │   │     Redis       │   │   JWT Crypto    │
+│   (users DB)    │   │  (token hashes  │   │  (stateless     │
+│                 │   │  + rate limits) │   │   verification) │
+└─────────────────┘   └─────────────────┘   └─────────────────┘
 
 
-  LOGIN
-  ─────
-  Client ──POST /login──► Rate limit check (Redis)
-                          Fetch user (Postgres)
-                          bcrypt.compare()  ← always runs, even for fake users*
-                          Generate accessToken (15m JWT)
-                          Generate refreshToken (7d JWT)
-                          Store SHA256(refreshToken) in Redis with 7d TTL
-         ◄── 200 { accessToken, refreshToken } ────────────────────────────────────────
+  REGISTER ──────────► Validate → Check duplicate (Postgres)
+                        bcrypt.hash(password, 12)
+                        INSERT user
+                     ◄─ 201 { user }
 
-  * Running bcrypt for non-existent users prevents timing attacks that reveal valid emails
+  LOGIN ─────────────► Rate limit check (Redis)
+                        Fetch user (Postgres)
+                        bcrypt.compare()  ← always runs*
+                        Generate accessToken (15m) + refreshToken (7d)
+                        redis.setex(rt:<userId>, SHA256(refreshToken))
+                     ◄─ 200 { accessToken, refreshToken }
 
+  GET /me ───────────► authenticate middleware
+  Bearer <token>         jwt.verify()  ← zero DB call
+                         req.userId = decoded.sub
+                         Fetch user (Postgres)
+                      ◄─ 200 { user }
 
-  PROTECTED ROUTE  (e.g. GET /me)
-  ───────────────
-  Client ──GET /me──► authenticate middleware
-  Authorization:       Extract "Bearer <token>" from header
-  Bearer <token>       jwt.verify(token)  ← pure crypto, zero DB calls
-                       req.userId = decoded.sub
-                       Fetch user from Postgres
-         ◄── 200 { user } ──────────────────────────────────────────────────────────────
+  REFRESH ───────────► Verify JWT signature
+  { refreshToken }      redis.get(rt:<userId>)
+                        Compare SHA256(incoming) vs stored hash
+                        │
+                        ├── MATCH ────► Rotate: new pair, new Redis hash
+                        │           ◄── 200 { newAccessToken, newRefreshToken }
+                        │
+                        └── MISMATCH ──► redis.del(rt:<userId>)  ← nuke all sessions
+                                     ◄── 401 { code: "TOKEN_REUSE" }
 
+  LOGOUT ────────────► Verify token → extract userId
+  { refreshToken }      redis.del(rt:<userId>)
+                     ◄─ 200 Logged out
 
-  REFRESH
-  ───────
-  Client ──POST /refresh──► Verify refresh token JWT signature
-         { refreshToken }   Fetch SHA256 hash from Redis
-                            Hash incoming token → compare
-                            │
-                            ├── MATCH → Generate new token pair
-                            │          Store new hash in Redis (old one is gone)
-                            │   ◄── 200 { newAccessToken, newRefreshToken } ──────────
-                            │
-                            └── MISMATCH → Token reuse detected*
-                                           Delete all sessions from Redis
-                                ◄── 401 { code: "TOKEN_REUSE" } ───────────────────────
-
-  * A valid JWT that doesn't match the Redis hash = it was already rotated.
-    This means the token was stolen. Response: nuke everything.
-
-
-  LOGOUT
-  ──────
-  Client ──POST /logout──► Verify refresh token → Get userId
-         { refreshToken }   redis.del(rt:<userId>)
-         ◄── 200 Logged out ─────────────────────────────────────────────────────────
-
-
-  RATE LIMITING  (on login)
-  ─────────────
-  Failed attempt → redis.incr(login_attempts:<ip>)
-                   EXPIRE key at 15 min (set only on first failure)
-                   On 5th failure → extend lock to 30 min
-
-  Next request  → redis.get(login_attempts:<ip>) >= 5
-               ◄── 429 Too Many Requests
+  * bcrypt runs even for non-existent users → prevents timing-based
+    email enumeration (attacker can't tell which emails are registered)
 ```
 
 ---
 
-## Stack
+## 🛠️ Tech Stack
 
-| Package | What it does here |
-|---|---|
-| `express` | HTTP server and routing |
-| `pg` | PostgreSQL connection pool |
-| `bcrypt` | Password hashing (12 rounds ≈ 250ms per hash) |
-| `jsonwebtoken` | Sign and verify JWTs |
-| `ioredis` | Redis client with auto-reconnect |
-| `dotenv` | Load `.env` into `process.env` |
-| `nodemon` | Dev server with auto-restart |
+| Technology | Purpose |
+|------------|---------|
+| **Express 5** | HTTP server and routing |
+| **PostgreSQL** | User storage with UUID primary keys |
+| **pg (Pool)** | Connection pooling — multiple concurrent requests |
+| **bcrypt** | Password hashing at 12 rounds (~250ms per hash) |
+| **jsonwebtoken** | Sign and verify access + refresh tokens |
+| **ioredis** | Redis client with exponential backoff retry |
+| **dotenv** | Load secrets from `.env` into `process.env` |
+| **nodemon** | Dev server with auto-restart |
 
 ---
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 jwt-auth-api/
-├── server.js                    ← Starts server, triggers DB + Redis connections
-├── app.js                       ← Express app config, routes, error handlers
+├── server.js                    ← Entry point — starts server, connects DB + Redis
+├── app.js                       ← Express config, routes, error handlers
 ├── .env                         ← Secrets (never commit this)
+├── package.json
 └── src/
     ├── config/
-    │   ├── db.js                ← PostgreSQL pool setup
-    │   └── redis.js             ← Redis client with retry backoff
+    │   ├── db.js                ← PostgreSQL Pool setup (tested on startup)
+    │   └── redis.js             ← ioredis client with retry backoff
     ├── controllers/
     │   └── authController.js    ← register, login, refresh, logout, me
     ├── middleware/
-    │   ├── auth.js              ← Verifies Bearer token on protected routes
-    │   └── rateLimit.js        ← Tracks failed logins per IP in Redis
+    │   ├── auth.js              ← Bearer token extraction + JWT verification
+    │   └── rateLimit.js        ← Redis failed-login counter per IP
     ├── routes/
-    │   └── auth.js              ← Maps endpoints to controllers
+    │   └── auth.js              ← Maps endpoints → middleware → controllers
     └── utils/
-        └── tokens.js            ← JWT helpers + SHA-256 token hasher
+        └── tokens.js            ← generateAccessToken, generateRefreshToken,
+                                    verifyAccessToken, verifyRefreshToken, hashToken
 ```
 
 ---
 
-## Setup
+## 🔒 Why Hash Refresh Tokens?
 
-**1. Install dependencies**
+Refresh tokens are stored in Redis as **SHA-256 hashes**, never as raw tokens.
+
+```javascript
+// tokens.js
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+// authController.js — on login
+const tokenHash = hashToken(refreshToken);
+await redis.setex(`rt:${user.id}`, EXPIRY_SECONDS, tokenHash);
+
+// authController.js — on refresh
+const incomingHash = hashToken(refreshToken);
+const storedHash = await redis.get(`rt:${userId}`);
+
+if (incomingHash !== storedHash) {
+  // Token reuse detected — invalidate everything
+  await redis.del(`rt:${userId}`);
+  return res.status(401).json({ code: 'TOKEN_REUSE' });
+}
+```
+
+**Why SHA-256 and not bcrypt?**
+bcrypt is intentionally slow (designed for passwords). Token comparison happens on every `/refresh` call and needs to be fast. SHA-256 takes microseconds and is cryptographically strong enough for this use case.
+
+---
+
+## 🚀 Why Redis for Rate Limiting?
+
+Rate limiting is Redis-backed, not in-memory.
+
+```javascript
+// rateLimit.js
+async function recordFailedAttempt(ip) {
+  const key = `login_attempts:${ip}`;
+  const count = await redis.incr(key);
+
+  if (count === 1) await redis.expire(key, 15 * 60);   // 15 min window
+  if (count >= 5)  await redis.expire(key, 30 * 60);   // extend lock on 5th failure
+}
+```
+
+**Why not in-memory?**
+In-memory counters are per-process. Run 2 Node instances with PM2 and the effective limit doubles — one attacker gets 10 attempts instead of 5. Redis is shared across all instances. The counter is always accurate.
+
+**Fail-open on Redis errors** — if Redis is down, requests are allowed through. Deliberate tradeoff: availability over security during outages.
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- Node.js ≥ 18.x
+- PostgreSQL (local or hosted)
+- Redis Server
+
+### 1. Install dependencies
 
 ```bash
-npm install express pg bcrypt jsonwebtoken ioredis dotenv
-npm install -D nodemon
+npm install
 ```
 
-**2. Set up `.env`**
+### 2. Configure `.env`
 
-```env
-PORT=3000
-
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=jwt_auth
-DB_USER=postgres
-DB_PASSWORD=yourpassword
-
-REDIS_HOST=localhost
-REDIS_PORT=6379
-
-# Generate with: node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
-ACCESS_TOKEN_SECRET=your_access_token_secret_here
-REFRESH_TOKEN_SECRET=your_refresh_token_secret_here
-
-ACCESS_TOKEN_EXPIRY=15m
-REFRESH_TOKEN_EXPIRY=7d
-REFRESH_TOKEN_EXPIRY_SECONDS=604800
+```bash
+cp .env.example .env   # then fill in your values
 ```
 
-**3. Create the database**
+### 3. Set up the database
+
+Run in `psql`:
 
 ```sql
 CREATE DATABASE jwt_auth;
@@ -165,114 +236,91 @@ CREATE TABLE users (
 CREATE INDEX idx_users_email ON users(email);
 ```
 
-**4. Run**
+### 4. Run the server
 
 ```bash
-npm run dev
+npm run dev    # nodemon — restarts on file save
+npm start      # node — production
 ```
 
 ---
 
-## Endpoints
 
-| Method | Endpoint | Protected | What it does |
-|---|---|---|---|
-| POST | `/api/auth/register` | ✗ | Creates a new user |
-| POST | `/api/auth/login` | ✗ | Returns access + refresh tokens |
-| POST | `/api/auth/refresh` | ✗ | Rotates token pair using refresh token |
-| POST | `/api/auth/logout` | ✗ | Deletes refresh token from Redis |
-| GET  | `/api/auth/me` | ✓ Bearer | Returns current user's profile |
+## 📡 API Reference
 
----
+| Method | Endpoint | Protected | Description |
+|--------|----------|-----------|-------------|
+| `POST` | `/api/auth/register` | ✗ | Create a new user account |
+| `POST` | `/api/auth/login` | ✗ | Login and receive token pair |
+| `POST` | `/api/auth/refresh` | ✗ | Rotate tokens using refresh token |
+| `POST` | `/api/auth/logout` | ✗ | Invalidate refresh token in Redis |
+| `GET`  | `/api/auth/me` | ✓ Bearer | Get current user profile |
 
-## Testing with Postman
+### Request / Response Examples
 
-Run these in order — each step builds on the last.
-
-**Step 1 — Register**
-```
+**Register**
+```json
 POST /api/auth/register
-{ "email": "test@example.com", "password": "password123" }
-→ 201 with user object
+{ "email": "user@example.com", "password": "password123" }
+
+→ 201
+{ "success": true, "user": { "id": "uuid", "email": "...", "createdAt": "..." } }
 ```
 
-**Step 2 — Try to register the same email**
-```
-POST /api/auth/register
-{ "email": "test@example.com", "password": "password123" }
-→ 409 Conflict
-```
-
-**Step 3 — Login** *(save both tokens)*
-```
+**Login**
+```json
 POST /api/auth/login
-{ "email": "test@example.com", "password": "password123" }
-→ 200 with accessToken + refreshToken
+{ "email": "user@example.com", "password": "password123" }
+
+→ 200
+{ "success": true, "accessToken": "eyJ...", "refreshToken": "eyJ..." }
 ```
 
-**Step 4 — Hit a protected route**
-```
-GET /api/auth/me
-Authorization: Bearer <your_access_token>
-→ 200 with user profile
-```
-
-**Step 5 — Hit it with a bad token**
-```
-GET /api/auth/me
-Authorization: Bearer garbage
-→ 401 Invalid access token
-```
-
-**Step 6 — Refresh your tokens** *(save the NEW refresh token)*
-```
+**Refresh**
+```json
 POST /api/auth/refresh
-{ "refreshToken": "<your_refresh_token>" }
-→ 200 with brand new accessToken + refreshToken
-```
+{ "refreshToken": "eyJ..." }
 
-**Step 7 — Replay the OLD refresh token**
-```
-POST /api/auth/refresh
-{ "refreshToken": "<the OLD refresh token>" }
-→ 401 TOKEN_REUSE — all sessions killed
-```
+→ 200
+{ "success": true, "accessToken": "eyJ...(new)", "refreshToken": "eyJ...(new)" }
 
-**Step 8 — Trigger rate limiting**
-```
-POST /api/auth/login with wrong password — repeat 5 times
-6th attempt → 429 Too Many Requests
-```
-
-**Step 9 — Logout**
-```
-POST /api/auth/logout
-{ "refreshToken": "<current_refresh_token>" }
-→ 200 Logged out
-```
-
-**Step 10 — Refresh after logout**
-```
-POST /api/auth/refresh
-{ "refreshToken": "<same token>" }
-→ 401 Refresh token not found
+→ 401 (reuse detected)
+{ "success": false, "code": "TOKEN_REUSE", "message": "..." }
 ```
 
 ---
 
-## Key Design Decisions
+## 🧪 Testing with Postman
 
-**Why hash refresh tokens in Redis?**
-If Redis is ever compromised, the attacker gets SHA-256 hashes — not valid tokens. Same reason you store password hashes instead of passwords.
+Run these **in order** — each step builds on the last.
 
-**Why SHA-256 instead of bcrypt for tokens?**
-bcrypt is intentionally slow (that's the point for passwords). Hashing a token on every `/refresh` call needs to be fast. SHA-256 is cryptographically strong and takes microseconds.
+| Step | Request | Expected |
+|------|---------|----------|
+| 1 | `POST /register` with valid credentials | `201` user object |
+| 2 | `POST /register` with same email | `409` Conflict |
+| 3 | `POST /login` *(save both tokens)* | `200` with token pair |
+| 4 | `GET /me` with `Authorization: Bearer <accessToken>` | `200` user profile |
+| 5 | `GET /me` with `Authorization: Bearer garbage` | `401` Invalid token |
+| 6 | `POST /refresh` with refresh token *(save new token)* | `200` new token pair |
+| 7 | `POST /refresh` with the **old** refresh token | `401` TOKEN_REUSE — all sessions killed |
+| 8 | `POST /login` with wrong password × 5, then × 6 | `401` × 5, then `429` |
+| 9 | `POST /logout` with current refresh token | `200` Logged out |
+| 10 | `POST /refresh` after logout | `401` Token not found |
 
-**Why run bcrypt even when the user doesn't exist?**
-If you return early on "user not found", an attacker can measure how fast the response is. bcrypt taking ~250ms reveals which emails exist. Always run it.
+---
 
-**Why Redis for rate limiting instead of in-memory?**
-In-memory counters live per-process. With 2 Node instances (PM2, clusters), each tracks its own count — the limit is effectively doubled. Redis is shared across all instances.
+## 👥 Contributors
 
-**Why `trust proxy 1` in app.js?**
-Behind nginx or a load balancer, `req.ip` would always be the proxy's IP without this. Every user would share the same rate limit counter. One bad actor locks everyone out.
+- [Rahil](https://github.com/rahil-den)
+
+---
+
+## 📄 License
+
+This project is licensed under the ISC License.
+
+---
+
+<p align="center">
+  Built while learning production-grade backend auth patterns 🚀
+</p>
