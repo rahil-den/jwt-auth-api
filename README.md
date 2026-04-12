@@ -309,17 +309,12 @@ Run these **in order** — each step builds on the last.
 
 ---
 
-## 👥 Contributors
+## 👥 Made by
 
 - [Rahil](https://github.com/rahil-den)
 
 ---
 
-## 📄 License
-
-This project is licensed under the ISC License.
-
----
 
 <p align="center">
   Built while learning production-grade backend auth patterns 🚀
