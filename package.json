@@ -4,7 +4,7 @@
   "description": "This is a REST API built with Node.js and Express that implements JWT authentication. It allows users to register, log in, and access protected routes using JSON Web Tokens",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon index.js",
+    "dev": "nodemon server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
