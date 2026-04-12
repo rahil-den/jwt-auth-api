@@ -41,3 +41,48 @@ catch(err){
     next();
 }
 }
+
+
+async function recordFailedAttempt(ip){
+  const key = `login_attempts:${ip}`;
+  
+  try {
+    const count = await redis.incr(key);
+
+    
+    // Only set the TTL on the first failed attempt
+    // WHY: We use INCR then conditional EXPIRE, not SET with EX.
+    // This prevents resetting the window on every failure.
+
+    if( count === 1){
+      await redis.expire(key, WINDOW_SECONDS);
+    }
+
+    // When they hit the limit, extend the lock window.
+    if(count >= MAX_ATTEMPTS){
+      await redis.expire(key, LOCK_WINDOW_SECONDS);
+    }
+
+    return count;
+
+
+  } catch (error) {
+    console.log('Failed to record login attempt: ', err.message);
+  }
+}
+
+async function clearFailedAttempts(ip){
+    const key = `login_attempts:${ip}`;
+
+    try {
+      await redis.del(key);
+    } catch (error) {
+      console.log('Failed to clear failed attempts: ', error.message);
+    }
+}
+
+module.exports = {
+  loginRateLimit,
+  recordFailedAttempt,
+  clearFailedAttempts,
+};
