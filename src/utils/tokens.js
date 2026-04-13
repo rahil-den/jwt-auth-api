@@ -3,8 +3,8 @@
 // We store SHA-256(refreshToken) and compare hashes on each request.
 // This is the same principle as storing password hashes instead of passwords.
 
-import { sign, verify } from 'jsonwebtoken';
-import { createHash } from 'crypto';
+const { sign, verify } = require('jsonwebtoken');
+const { createHash } = require('crypto');
 
 /**
  * Generate a signed access token (short-lived, stateless)
@@ -65,7 +65,7 @@ function hashToken(token) {
   return createHash('sha256').update(token).digest('hex');
 }
 
-export default {
+module.exports = {
   generateAccessToken,
   generateRefreshToken,
   verifyAccessToken,
