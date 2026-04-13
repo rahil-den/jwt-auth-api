@@ -39,7 +39,7 @@
         },
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"email\": \"sahil@example.com\",\n  \"password\": \"password123\"\n}"
+          "raw": "{\n  \"email\": \"rahil@example.com\",\n  \"password\": \"password123\"\n}"
         },
         "description": "Register a new user. Returns user id, email, and createdAt."
       },
@@ -76,7 +76,7 @@
         },
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"email\": \"sahil@example.com\",\n  \"password\": \"password123\"\n}"
+          "raw": "{\n  \"email\": \"abc@example.com\",\n  \"password\": \"password123\"\n}"
         },
         "description": "Login with email and password. Access token and refresh token are auto-saved to collection variables."
       },
